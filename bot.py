@@ -11,7 +11,8 @@ import asyncio
 import io
 import json
 import os
-from typing import Callable, Optional
+import re
+from typing import AsyncIterator, Callable, Optional
 
 import aiohttp
 import discord
@@ -28,6 +29,7 @@ GRAYOFFICE_URL = os.getenv("GRAYOFFICE_URL", "http://localhost:5173").rstrip("/"
 BOT_INGEST_TOKEN = os.environ["BOT_INGEST_TOKEN"]
 
 INGEST_ENDPOINT = f"{GRAYOFFICE_URL}/api/bots/ingest"
+STREAM_ENDPOINT = f"{GRAYOFFICE_URL}/api/bots/ingest/stream"
 LINK_START_ENDPOINT = f"{GRAYOFFICE_URL}/api/bots/link/start"
 LINK_STATUS_ENDPOINT = f"{GRAYOFFICE_URL}/api/bots/link/status"
 LINK_REVOKE_ENDPOINT = f"{GRAYOFFICE_URL}/api/bots/link/revoke"
@@ -97,6 +99,146 @@ async def call_ingest(
         raise BackendError(f"network error: {e}") from e
     except asyncio.TimeoutError as e:
         raise BackendError("the backend took too long to respond") from e
+
+
+# ---------------------------------------------------------------- live streaming
+
+# Friendly labels for the agent's tools, so a step reads like a status line.
+TOOL_LABELS = {
+    "recallMemory": "🧠 Recalling what I know about you",
+    "saveMemory": "🧠 Saving that for next time",
+    "listInvoices": "📋 Checking your invoices",
+    "getInvoiceDetail": "📋 Reading an invoice",
+    "createInvoice": "🧾 Drafting an invoice",
+    "markInvoicePaid": "✅ Marking an invoice paid",
+    "processInvoiceDocument": "🧾 Turning the document into an invoice",
+    "searchKnowledgeBase": "📚 Searching your documents",
+    "listDocuments": "📚 Listing your documents",
+    "getDocument": "📄 Reading a document",
+    "computeGst": "🧮 Working out the GST",
+    "setHomeJurisdiction": "🗺️ Noting your jurisdiction",
+    "getBankAccount": "🏦 Checking the bank account",
+    "reconcileBank": "🔁 Reconciling the bank",
+    "bankTransfer": "🏦 Preparing a transfer",
+    "cashReport": "💰 Building the cash report",
+    "listJournalEntries": "📒 Reading the ledger",
+    "createJournalEntry": "📒 Posting to the ledger",
+    "postJournalEntry": "📒 Posting a journal entry",
+    "flagJournalEntry": "🚩 Flagging a journal entry",
+    "monthEndClose": "📆 Running the month-end close",
+    "listInventory": "📦 Checking inventory",
+    "addInventoryItem": "📦 Adding an inventory item",
+    "inventorySpend": "📦 Recording inventory spend",
+    "listPaymentIntegrations": "💳 Checking payment gateways",
+    "getPaymentData": "💳 Pulling payment data",
+    "refundPayment": "💳 Preparing a refund",
+    "listOrgMembers": "👥 Checking your team",
+    "listAuditEvents": "🗂️ Reviewing the audit log",
+    "listCompanies": "🏢 Checking counterparties",
+    "addCompany": "🏢 Adding a counterparty",
+    "transactionsByJurisdiction": "🗺️ Grouping transactions by jurisdiction",
+    "addAccrual": "📈 Recording an accrual",
+    "listAccruals": "📈 Reading accruals",
+    "reverseAccrual": "📈 Reversing an accrual",
+}
+
+
+def tool_label(name: str) -> str:
+    if name in TOOL_LABELS:
+        return TOOL_LABELS[name]
+    words = re.sub(r"(?<!^)(?=[A-Z])", " ", name).lower().strip()
+    return f"⚙️ {words}" if words else "⚙️ Working"
+
+
+async def stream_ask(
+    session: aiohttp.ClientSession, text: str, external_user: str
+) -> AsyncIterator[tuple[str, str]]:
+    """Yield ('step', label) updates then a final ('done', answer) / ('error', msg)."""
+    payload = {"source": "discord", "externalUser": external_user, "text": text}
+    try:
+        async with session.post(STREAM_ENDPOINT, json=payload, headers=HEADERS) as resp:
+            if resp.status != 200:
+                body = (await resp.text())[:300]
+                yield "error", f"Backend error ({resp.status}): {body}"
+                return
+            event: Optional[str] = None
+            async for raw in resp.content:
+                line = raw.decode("utf-8", "replace").rstrip("\r\n")
+                if not line:
+                    event = None
+                    continue
+                if line.startswith("event:"):
+                    event = line[6:].strip()
+                elif line.startswith("data:"):
+                    try:
+                        data = json.loads(line[5:].strip())
+                    except json.JSONDecodeError:
+                        continue
+                    if event == "step":
+                        kind = data.get("kind")
+                        if kind == "tool":
+                            yield "step", tool_label(data.get("name", ""))
+                        elif kind == "writing":
+                            yield "step", "✍️ Writing the answer"
+                        elif kind == "start":
+                            yield "step", "🔎 Looking into it"
+                        elif kind == "error":
+                            yield "step", f"⚠️ {str(data.get('message', ''))[:120]}"
+                    elif event == "done":
+                        answer = str(data.get("text", "")).strip()
+                        if data.get("linked") is False:
+                            answer += (
+                                "\n\n_Tip: run `/login` to connect your Gray Office "
+                                "account so I can use your books and documents._"
+                            )
+                        yield "done", answer
+                        return
+    except aiohttp.ClientError as e:
+        yield "error", f"Could not reach Gray Office: {e}"
+    except asyncio.TimeoutError:
+        yield "error", "Gray Office took too long to respond."
+
+
+def _thinking_embed(steps: list[str]) -> discord.Embed:
+    shown = steps[-8:]
+    body = "\n".join(f"• {s}" for s in shown) if shown else "• 🔎 Looking into it"
+    return discord.Embed(title="💭 Working on it…", description=body[:4000], color=BRAND)
+
+
+async def progressive_ask(
+    external_user: str,
+    text: str,
+    send: Callable,
+    edit: Callable,
+) -> None:
+    """Drive a live 'thinking' message: `send(embed=)` -> message, `edit(msg, embed)`."""
+    steps: list[str] = []
+    msg = await send(embed=_thinking_embed(steps))
+    last_edit = 0.0
+    final: Optional[str] = None
+
+    async for kind, value in stream_ask(client.session, text, external_user):
+        if kind == "step":
+            steps.append(value)
+            now = asyncio.get_event_loop().time()
+            if now - last_edit > 1.3:
+                last_edit = now
+                try:
+                    await edit(msg, _thinking_embed(steps))
+                except discord.HTTPException:
+                    pass
+        else:  # done / error
+            final = value if kind == "done" else f"⚠️ {value}"
+            break
+
+    answer = final or "I couldn't produce an answer to that."
+    result_embed = discord.Embed(
+        title="💬 Gray Office", description=answer[:4000], color=BRAND
+    )
+    try:
+        await edit(msg, result_embed)
+    except discord.HTTPException:
+        pass
 
 
 async def link_start(session: aiohttp.ClientSession, user: discord.abc.User) -> dict:
@@ -195,6 +337,20 @@ def render_result(data: dict, *, source_name: Optional[str] = None) -> tuple[lis
     detail = data.get("detail")
     embeds: list[discord.Embed] = []
     files: list[discord.File] = []
+
+    queued = (data.get("kb") or {}).get("queued") or []
+    if queued:
+        embeds.append(
+            discord.Embed(
+                title="📚  Added to your knowledge base",
+                description=(
+                    "Indexing into memory and extracting line items now — ask me "
+                    "about it in a moment.\n"
+                    + "\n".join(f"• {n}" for n in queued)
+                )[:4000],
+                color=BRAND,
+            )
+        )
 
     if data.get("status") == "error":
         msg = detail.get("error") if isinstance(detail, dict) else detail
@@ -520,13 +676,14 @@ async def logout(interaction: discord.Interaction) -> None:
 @app_commands.describe(question="Your finance / books / invoice / GST question")
 async def ask(interaction: discord.Interaction, question: str) -> None:
     await interaction.response.defer(thinking=True)
-    try:
-        data = await call_ingest(client.session, question, actor(interaction.user), [])
-    except BackendError as exc:
-        await interaction.followup.send(embed=backend_err_embed(exc))
-        return
-    embeds, files = render_result(data)
-    await send_out(interaction.followup.send, embeds, files)
+
+    async def _send(**kw):
+        return await interaction.followup.send(**kw, wait=True)
+
+    async def _edit(m, embed):
+        await interaction.followup.edit_message(m.id, embed=embed)
+
+    await progressive_ask(actor(interaction.user), question, _send, _edit)
 
 
 @client.tree.command(
@@ -576,19 +733,22 @@ async def on_message(message: discord.Message) -> None:
     if not text and not attachments:
         return
 
-    async with message.channel.typing():
-        if attachments:
-            embeds, files = await process_documents(
-                client.session, attachments, text or None, message.author
-            )
-        else:
-            try:
-                embeds, files = render_result(
-                    await call_ingest(client.session, text, actor(message.author), [])
-                )
-            except BackendError as exc:
-                embeds, files = [backend_err_embed(exc)], []
+    if not attachments:
+        # Text: stream the agent's steps live into a single reply.
+        async def _send(**kw):
+            return await message.reply(**kw)
 
+        async def _edit(m, embed):
+            await m.edit(embed=embed)
+
+        async with message.channel.typing():
+            await progressive_ask(actor(message.author), text, _send, _edit)
+        return
+
+    async with message.channel.typing():
+        embeds, files = await process_documents(
+            client.session, attachments, text or None, message.author
+        )
     await send_out(message.reply, embeds, files)
 
 
