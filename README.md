@@ -6,7 +6,17 @@ A discord.py bot that forwards messages (mentions + DMs) and PDF attachments to
 the grayoffice backend at `POST <GRAYOFFICE_URL>/api/bots/ingest`. The backend
 does the AI routing — free text is answered by the Gray Office finance assistant,
 PDFs come back as structured JSON — and the bot replies with the result.
-`/ping` still checks responsiveness; `/ask <question>` queries the backend AI.
+
+## Commands
+
+- `/ping` — check responsiveness.
+- `/ask <question>` — query the Gray Office finance assistant.
+- `/login` — connect your Gray Office account. The bot DMs you a short code;
+  open the linked URL, sign in, and enter the code. Once linked, every message
+  you send the bot is tied to your Gray Office account (audit log + the assistant
+  knows who it's talking to).
+- `/whoami` — show which Gray Office account is connected.
+- `/logout` — disconnect your Gray Office account.
 
 ## Setup
 
