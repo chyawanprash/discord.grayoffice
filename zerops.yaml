@@ -2,7 +2,7 @@ zerops:
   # Production — vendor deps into ./vendor, ship a minimal artifact, run the
   # bot as a long-lived worker. The Discord bot holds a gateway websocket; it
   # is not an HTTP service, so no ports / readiness check are declared.
-  - setup: prod
+  - setup: discordgrayoffice
     build:
       base: python@3.11
 
