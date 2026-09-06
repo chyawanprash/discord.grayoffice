@@ -2,7 +2,11 @@
 
 discord extension for grayoffice
 
-A minimal discord.py bot that responds to the `/ping` slash command.
+A discord.py bot that forwards messages (mentions + DMs) and PDF attachments to
+the grayoffice backend at `POST <GRAYOFFICE_URL>/api/bots/ingest`. The backend
+does the AI routing — free text is answered by the Gray Office finance assistant,
+PDFs come back as structured JSON — and the bot replies with the result.
+`/ping` still checks responsiveness; `/ask <question>` queries the backend AI.
 
 ## Setup
 
@@ -15,9 +19,11 @@ A minimal discord.py bot that responds to the `/ping` slash command.
    pip install -r requirements.txt
    ```
 
-4. Copy `.env.example` to `.env` and fill in `DISCORD_TOKEN`. Optionally set
+4. Copy `.env.example` to `.env` and fill in `DISCORD_TOKEN`, `GRAYOFFICE_URL`,
+   and `BOT_INGEST_TOKEN` (must match grayoffice's `.dev.vars`). Optionally set
    `GUILD_ID` to a test server ID so slash commands sync instantly (global sync
-   can take up to an hour).
+   can take up to an hour). Enable the **Message Content Intent** for the bot in
+   the Developer Portal so it can read message text.
 
 ## Run
 
